@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>예산서 검토 도구 v1</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+</head>
+<body>
+  <main class="wrap">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">1차 검토용</p>
+        <h1>예산서 자동 검토 도구</h1>
+        <p class="desc">예산서 작성서식과 세출예산명세서를 비교하여 퇴직적립금, 교직원 급여·수당 편성 여부를 점검합니다.</p>
+      </div>
+      <div class="security-card">
+        <strong>보안 안내</strong>
+        <p>파일은 서버로 업로드하지 않고 현재 브라우저 안에서만 분석합니다. 공용 PC에서는 사용 후 새로고침 또는 브라우저 종료를 권장합니다.</p>
+      </div>
+    </header>
+
+    <section class="panel grid">
+      <label class="upload-box">
+        <span class="label-title">1. 예산서 작성서식</span>
+        <span class="label-desc">엑셀(.xlsx/.xls) 또는 엑셀에서 변환한 텍스트형 PDF</span>
+        <input id="formFile" type="file" accept=".xlsx,.xls,.pdf" />
+      </label>
+      <label class="upload-box">
+        <span class="label-title">2. 예산서 / 세출예산명세서</span>
+        <span class="label-desc">PDF 권장. 세출예산명세서 부분을 분석합니다.</span>
+        <input id="budgetFile" type="file" accept=".pdf,.xlsx,.xls" />
+      </label>
+    </section>
+
+    <section class="panel options">
+      <div>
+        <h2>검토 기준</h2>
+        <p>백원 단위 절사·올림 차이를 고려하여 금액 비교 시 ±1,000원을 허용합니다.</p>
+      </div>
+      <button id="runBtn" class="primary">검토 시작</button>
+    </section>
+
+    <section id="status" class="status hidden"></section>
+
+    <section class="panel hidden" id="summaryPanel">
+      <h2>검토 결과 요약</h2>
+      <div id="summary" class="summary"></div>
+    </section>
+
+    <section class="panel hidden" id="issuesPanel">
+      <h2>지적사항</h2>
+      <div id="issues"></div>
+      <button id="copyBtn" class="secondary">결과 복사</button>
+    </section>
+
+    <section class="panel hidden" id="debugPanel">
+      <details>
+        <summary>인식 상세 보기</summary>
+        <pre id="debug"></pre>
+      </details>
+    </section>
+  </main>
+  <script src="script.js"></script>
+</body>
+</html>
