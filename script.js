@@ -477,3 +477,360 @@ function renderResult(result, formData, budgetData) {
 function escapeHtml(s) {
   return String(s).replace(/[&<>'"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
 }
+
+/* ===== v1.2 보강 패치: 보수일람표 열 기반 파싱 + PDF 목 추적 + 오편성 합산 탐색 ===== */
+
+const ALL_BUDGET_MOK_HEADINGS = [
+  '교원급여','교원수당','교원법정부담금','교원퇴직금및퇴직적립금','교원퇴직적립금',
+  '직원급여','직원수당','직원법정부담금','직원퇴직금및퇴직적립금','직원퇴직적립금',
+  '그밖의인건비','통학차량이용비','일반급식비간식비','방과후특성화비','방과후교육돌봄비',
+  '수용비','수수료및제세공과금','연료비','여비','일반업무추진비','직책급업무추진비','적립금','시설비','취득비','유지비'
+];
+const REVIEW_TARGET_MOKS = ['교원급여','교원수당','직원급여','직원수당'];
+const DEDUCT_WORDS = ['소득세','주민세','본인부담금','공제','실수령','건강보험','장기요양','고용보험','사학연금','국민연금'];
+const ALLOWANCE_WORDS = ['수당','보조','급식','식대','연구','교통','명절','상여','휴가','성과','처우','운전'];
+
+// 기존 sheetToRows는 서식 때문에 16,384열까지 도는 파일에서 느리고 불안정해서 실제 값이 있는 범위 중심으로 재정의
+function sheetToRows(sheet, maxRows = Infinity) {
+  if (!sheet) return [];
+  const cellKeys = Object.keys(sheet).filter(k => /^[A-Z]+\d+$/.test(k));
+  if (!cellKeys.length) return [];
+  let minR = Infinity, minC = Infinity, maxR = -1, maxC = -1;
+  for (const key of cellKeys) {
+    const p = XLSX.utils.decode_cell(key);
+    const cell = sheet[key];
+    const value = cell ? (cell.w ?? cell.v ?? '') : '';
+    if (String(value ?? '').trim() === '') continue;
+    minR = Math.min(minR, p.r); minC = Math.min(minC, p.c);
+    maxR = Math.max(maxR, p.r); maxC = Math.max(maxC, p.c);
+  }
+  if (maxR < 0) return [];
+  if (Number.isFinite(maxRows)) maxR = Math.min(maxR, minR + maxRows - 1);
+  const merges = sheet['!merges'] || [];
+  const rows = [];
+  for (let r = minR; r <= maxR; r++) {
+    const row = [];
+    for (let c = minC; c <= maxC; c++) {
+      const addr = XLSX.utils.encode_cell({ r, c });
+      let cell = sheet[addr];
+      if (!cell) {
+        const merge = merges.find(m => r >= m.s.r && r <= m.e.r && c >= m.s.c && c <= m.e.c);
+        if (merge) cell = sheet[XLSX.utils.encode_cell(merge.s)];
+      }
+      row.push(cell ? (cell.w ?? cell.v ?? '') : '');
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+function parsePayrollRows(rows) {
+  const cleaned = rows.map(r => r.map(v => String(v ?? '').replace(/\n/g, ' ').trim()));
+  const headerRow = findPayrollHeaderRow(cleaned);
+  if (headerRow < 0) return parsePayrollRowsFallback(cleaned);
+  const headers = buildPayrollHeaders(cleaned, headerRow);
+  const roleCol = findHeaderCol(headers, ['직명','직위','직종']);
+  const salaryCols = headers.map((h, i) => isSalaryHeader(h) ? i : -1).filter(i => i >= 0);
+  const allowanceCols = headers.map((h, i) => isAllowanceHeader(h) ? i : -1).filter(i => i >= 0);
+
+  const teacherSubtotal = findSubtotalRow(cleaned, headerRow, ['소계교원','교원소계']);
+  const staffSubtotal = findSubtotalRow(cleaned, headerRow, ['소계일반직','일반직소계','소계직원','직원소계']);
+  const items = [];
+
+  // 1) 기본급은 직명별로 묶어서 오편성 추적이 가능하게 함(차량기사 등)
+  const roleSalaryMap = new Map();
+  for (let r = headerRow + 1; r < cleaned.length; r++) {
+    const row = cleaned[r];
+    const rowText = normalizeText(row.join(' '));
+    if (!rowText || rowText.includes('소계') || rowText.includes('합계')) continue;
+    const role = row[roleCol] || '';
+    if (!role) continue;
+    const group = staffSubtotal >= 0 && r > teacherSubtotal ? 'staffSalary' : 'teacherSalary';
+    const roleKey = normalizeRole(role, group);
+    const salary = salaryCols.reduce((acc, c) => acc + parseMoney(row[c]), 0);
+    if (salary > 0) {
+      const key = `${group}|${roleKey}`;
+      roleSalaryMap.set(key, (roleSalaryMap.get(key) || 0) + salary);
+    }
+  }
+  for (const [key, amount] of roleSalaryMap.entries()) {
+    const [bucket, label] = key.split('|');
+    items.push({ label: `${label} 급여`, amount, bucket, source: '직명별 기본급 합계' });
+  }
+
+  // 2) 수당은 소계 행의 열별 합계를 읽음. PDF에서 세부 목이 없으면 통합편성 판단에 사용
+  addSubtotalAllowanceItems(items, cleaned, headers, teacherSubtotal, 'teacherAllowance');
+  addSubtotalAllowanceItems(items, cleaned, headers, staffSubtotal, 'staffAllowance');
+
+  // 너무 세분화된 급여가 PDF와 합산 비교될 수 있도록 bucket 총액도 보관
+  return normalizePayrollItems(items.filter(i => i.amount > 0));
+}
+
+function parsePayrollRowsFallback(rows) {
+  const items = [];
+  rows.forEach((row, idx) => {
+    const cells = row.map(v => String(v ?? '').trim()).filter(Boolean);
+    if (!cells.length) return;
+    const nums = cells.map(parseMoney).filter(n => n > 0);
+    if (!nums.length) return;
+    const label = cells.filter(c => !/^[-\d,\.\s원]+$/.test(c)).join(' ').replace(/\s+/g, ' ').trim();
+    const amount = Math.max(...nums);
+    const bucket = guessBucket(label);
+    if (label && bucket) items.push({ label, amount, bucket, row: idx + 1, source: 'fallback' });
+  });
+  return normalizePayrollItems(items);
+}
+
+function findPayrollHeaderRow(rows) {
+  let best = -1, score = 0;
+  rows.forEach((row, i) => {
+    const t = normalizeText(row.join(' '));
+    let s = 0;
+    if (t.includes('직명')) s += 3;
+    if (t.includes('기본급') || t.includes('본봉')) s += 4;
+    if (t.includes('지급액계')) s += 2;
+    if (t.includes('급식') || t.includes('식대')) s += 1;
+    if (s > score) { score = s; best = i; }
+  });
+  return score >= 5 ? best : -1;
+}
+
+function buildPayrollHeaders(rows, headerRow) {
+  const maxLen = Math.max(...rows.map(r => r.length));
+  const headers = [];
+  for (let c = 0; c < maxLen; c++) {
+    const parts = [];
+    for (let r = Math.max(0, headerRow - 1); r <= Math.min(rows.length - 1, headerRow + 1); r++) {
+      const v = rows[r]?.[c] || '';
+      if (v) parts.push(v);
+    }
+    headers[c] = parts.join(' ').replace(/\s+/g, ' ').trim();
+  }
+  return headers;
+}
+
+function findHeaderCol(headers, keys) {
+  let idx = headers.findIndex(h => keys.some(k => normalizeText(h).includes(normalizeText(k))));
+  return idx >= 0 ? idx : 1;
+}
+
+function isSalaryHeader(h) {
+  const n = normalizeText(h);
+  return (n.includes('기본급') || n.includes('본봉')) && !DEDUCT_WORDS.some(w => n.includes(normalizeText(w)));
+}
+
+function isAllowanceHeader(h) {
+  const n = normalizeText(h);
+  if (!n || DEDUCT_WORDS.some(w => n.includes(normalizeText(w)))) return false;
+  if (n.includes('지급액계')) return false;
+  if (isSalaryHeader(h)) return false;
+  return ALLOWANCE_WORDS.some(w => n.includes(normalizeText(w)));
+}
+
+function findSubtotalRow(rows, start, keys) {
+  for (let i = start + 1; i < rows.length; i++) {
+    const n = normalizeText(rows[i].join(' '));
+    if (keys.some(k => n.includes(k))) return i;
+  }
+  return -1;
+}
+
+function addSubtotalAllowanceItems(items, rows, headers, subtotalRow, bucket) {
+  if (subtotalRow < 0) return;
+  const row = rows[subtotalRow];
+  headers.forEach((h, c) => {
+    if (!isAllowanceHeader(h)) return;
+    const amount = parseMoney(row[c]);
+    if (amount > 0) items.push({ label: cleanHeaderLabel(h), amount, bucket, source: '소계 행 열별 합계' });
+  });
+}
+
+function cleanHeaderLabel(h) {
+  return h.replace(/[A-Z]\)?/g, '').replace(/일련 번호|직명|성 명|호봉|경력/g, '').replace(/\s+/g, ' ').trim() || h;
+}
+
+function normalizeRole(role, group) {
+  const n = normalizeText(role);
+  if (n.includes('원장')) return '원장';
+  if (n.includes('방과후교사')) return '방과후교사';
+  if (n.includes('정교사') || n.includes('교사') && group === 'teacherSalary') return '교사';
+  if (n.includes('교원')) return '교원';
+  if (n.includes('차량기사')) return '차량기사';
+  if (n.includes('차량보조')) return '차량보조';
+  if (n.includes('방과후보조')) return '방과후보조';
+  if (n.includes('보조교사')) return '보조교사';
+  if (n.includes('조리')) return '조리직원';
+  if (n.includes('영양')) return '영양사';
+  if (n.includes('환경') || n.includes('청소')) return '환경미화원';
+  if (n.includes('사무') || n.includes('행정')) return '사무직원';
+  if (n.includes('관리')) return '관리직';
+  return role.replace(/\d+/g, '').trim();
+}
+
+function parseBudgetEntries(text) {
+  const lines = text.split(/\n/).map(s => s.trim()).filter(Boolean);
+  const entries = [];
+  let currentMok = '';
+  let currentParent = '';
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].replace(/\s+/g, ' ').trim();
+    const clean = normalizeText(line);
+    const heading = detectBudgetHeading(clean);
+    if (heading) {
+      currentMok = heading;
+      if (!REVIEW_TARGET_MOKS.includes(heading) && !heading.includes('퇴직')) currentParent = heading;
+      continue;
+    }
+    const parent = detectParentHeading(clean);
+    if (parent) currentParent = parent;
+
+    if (line.includes('본예산') || line.includes('=') || /\d[\d,]*\s*원/.test(line)) {
+      let block = line;
+      let j = i + 1;
+      while (j < lines.length && !/=[^=]*\d[\d,]*\s*$/.test(block) && !/\d{1,3}(?:,\d{3})+\s*$/.test(block) && j < i + 6) {
+        const nextClean = normalizeText(lines[j]);
+        if (detectBudgetHeading(nextClean)) break;
+        block += ' ' + lines[j].replace(/\s+/g, ' ').trim();
+        j++;
+      }
+      const amount = extractFinalAmount(block);
+      if (amount > 0) {
+        const detail = extractBudgetDetail(block);
+        entries.push({ mok: currentMok, parent: currentParent || currentMok, detail: normalizeBudgetDetail(detail || block), formula: block.replace(/\s+/g, ' ').trim(), amount, pageHint: findPageHint(lines, i) });
+      }
+    }
+  }
+  return mergeSplitBudgetEntries(entries);
+}
+
+function detectBudgetHeading(clean) {
+  // 숫자가 섞인 산출내역 줄은 제목으로 보지 않음
+  if (/\d/.test(clean)) return '';
+  let found = '';
+  for (const h of ALL_BUDGET_MOK_HEADINGS) {
+    const nh = normalizeText(h);
+    if (clean === nh || clean.startsWith(nh)) {
+      if (!found || nh.length > normalizeText(found).length) found = h;
+    }
+  }
+  return found;
+}
+
+function detectParentHeading(clean) {
+  const parents = ['인건비','교원인건비','직원인건비','운영비','관리운영비','일반교육활동비','선택적교육활동비','그밖의교육활동비','시설설비비품비','잡지출','예비비및반환금'];
+  return parents.find(p => clean === normalizeText(p) || clean.startsWith(normalizeText(p))) || '';
+}
+
+function extractBudgetDetail(block) {
+  let left = block;
+  const wonIdx = left.search(/\d[\d,]*\s*원/);
+  if (wonIdx >= 0) left = left.slice(0, wonIdx);
+  left = left.replace(/\(본예산\)/g, '').replace(/\(보조금및지원금\)|\(수익자부담금\)|\(그밖의수입\)/g, '').trim();
+  return left;
+}
+
+function review(formData, budgetData) {
+  const issues = [];
+  const notices = [];
+  const entries = budgetData.entries || [];
+  const payroll = formData.payroll || [];
+
+  const hasRetirementCarryover = (formData.retirement?.carryoverTotal || 0) > 0;
+  const hasTeacherRetirement = entries.some(e => normalizeText(e.mok + e.detail).includes('교원퇴직'));
+  const hasStaffRetirement = entries.some(e => normalizeText(e.mok + e.detail).includes('직원퇴직'));
+  if (hasRetirementCarryover && !(hasTeacherRetirement || hasStaffRetirement)) {
+    issues.push({ type: 'danger', title: '퇴직적립금 미편성', text: `퇴직금 적립금 이월액 계가 ${fmt(formData.retirement.carryoverTotal)}원으로 인식되었으나, 세출예산명세서에 교원퇴직적립금 또는 직원퇴직적립금 편성 항목을 찾지 못했습니다.` });
+  }
+
+  for (const bucket of ['teacherSalary','teacherAllowance','staffSalary','staffAllowance']) {
+    const mok = bucketToMok(bucket);
+    const group = payroll.filter(p => p.bucket === bucket);
+    const expectedTotal = group.reduce((a, p) => a + p.amount, 0);
+    if (!expectedTotal) continue;
+    const normalEntries = entries.filter(e => normalizeText(e.mok).includes(normalizeText(mok)));
+    const normalTotal = normalEntries.reduce((a, e) => a + e.amount, 0);
+
+    // 통합편성 안내: 일반 산출내역명(교원수당/직원수당 등) 하나가 엑셀의 여러 열 합계와 일치하는 경우
+    const generic = findGenericIntegratedEntry(normalEntries, group, mok);
+    if (generic) notices.push({ type: 'warn', title: `${mok} 통합편성`, text: `${generic.labels} = ${fmt(generic.sum)}원 → PDF '${generic.entry.detail}' ${fmt(generic.entry.amount)}원으로 통합편성된 것으로 보입니다.` });
+
+    if (isSameMoney(expectedTotal, normalTotal)) continue;
+
+    const diff = Math.abs(expectedTotal - normalTotal);
+    const misplacedCombo = findMisplacedCombo(entries, mok, diff, group);
+    if (misplacedCombo.length) {
+      const labelGuess = guessIssueLabel(group, diff, bucket);
+      const locations = misplacedCombo.map(e => `${e.parent || e.mok || '다른 목'}의 '${e.detail}' ${fmt(e.amount)}원`).join(' + ');
+      issues.push({ type: 'danger', title: '오편성 의심', text: `${labelGuess} ${fmt(diff)}원이 ${mok}이 아닌 ${locations}에 편성된 것으로 보입니다.` });
+    } else {
+      issues.push({ type: 'danger', title: `${mok} 금액 불일치`, text: `엑셀 보수일람표 기준 ${mok} 합계는 ${fmt(expectedTotal)}원이나, PDF ${mok} 산출내역 합계는 ${fmt(normalTotal)}원으로 인식되었습니다. 차액 ${fmt(diff)}원을 확인해야 합니다.` });
+    }
+  }
+
+  const allIssues = [...issues, ...dedupeNotices(notices)];
+  if (!allIssues.length) allIssues.push({ type: 'ok', title: '지적사항 없음', text: '현재 1차 검토 기준에서 지적사항을 찾지 못했습니다.' });
+  return { issues: allIssues, counts: { payrollItems: payroll.length, budgetEntries: entries.length, issues: issues.length } };
+}
+
+function findGenericIntegratedEntry(normalEntries, group, mok) {
+  const genericEntries = normalEntries.filter(e => {
+    const d = normalizeText(e.detail);
+    const m = normalizeText(mok);
+    return d === m || d.endsWith(m) || d.includes(m);
+  });
+  if (!genericEntries.length || group.length < 2) return null;
+  // 명절/급식처럼 PDF에 개별 항목이 있는 것은 제외하고, 남은 항목 합계가 generic과 맞는지 확인
+  for (const entry of genericEntries) {
+    const explicitLabels = new Set(normalEntries.filter(e => e !== entry).map(e => normalizeText(e.detail)));
+    const candidates = group.filter(p => !Array.from(explicitLabels).some(d => similarLabel(normalizeText(p.label), d)));
+    const sum = candidates.reduce((a, p) => a + p.amount, 0);
+    if (candidates.length >= 2 && isSameMoney(sum, entry.amount)) {
+      return { entry, sum, labels: candidates.map(p => `${p.label} ${fmt(p.amount)}원`).join(' + ') };
+    }
+  }
+  return null;
+}
+
+function dedupeNotices(notices) {
+  const seen = new Set();
+  return notices.filter(n => { const k = n.title + n.text; if (seen.has(k)) return false; seen.add(k); return true; });
+}
+
+function findMisplacedCombo(entries, expectedMok, diff, group) {
+  const nExpected = normalizeText(expectedMok);
+  const keyWords = group.map(g => normalizeText(g.label)).join(' ');
+  let candidates = entries.filter(e => !normalizeText(e.mok).includes(nExpected) && !REVIEW_TARGET_MOKS.some(m => normalizeText(e.mok).includes(normalizeText(m))));
+  candidates = candidates.filter(e => isSameMoney(e.amount, diff) || similarLabel(keyWords, normalizeText(e.detail)) || normalizeText(e.detail + e.parent).includes('차량'));
+  const direct = candidates.find(e => isSameMoney(e.amount, diff));
+  if (direct) return [direct];
+  // 최대 4개까지 합산 탐색
+  const arr = candidates.slice(0, 30);
+  for (let size = 2; size <= 4; size++) {
+    const combo = findComboSum(arr, diff, size, 0, []);
+    if (combo) return combo;
+  }
+  return [];
+}
+
+function findComboSum(arr, target, size, start, picked) {
+  if (picked.length === size) {
+    const sum = picked.reduce((a, e) => a + e.amount, 0);
+    return isSameMoney(sum, target) ? picked : null;
+  }
+  for (let i = start; i < arr.length; i++) {
+    const res = findComboSum(arr, target, size, i + 1, [...picked, arr[i]]);
+    if (res) return res;
+  }
+  return null;
+}
+
+function guessIssueLabel(group, diff, bucket) {
+  const exact = group.find(p => isSameMoney(p.amount, diff));
+  if (exact) return exact.label;
+  if (bucket === 'staffSalary') {
+    const vehicle = group.filter(p => normalizeText(p.label).includes('차량'));
+    const vSum = vehicle.reduce((a, p) => a + p.amount, 0);
+    if (vehicle.length && isSameMoney(vSum, diff)) return '차량기사 급여';
+  }
+  return bucketToMok(bucket);
+}
