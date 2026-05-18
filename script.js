@@ -90,9 +90,9 @@ function readArrayBuffer(file) {
 }
 
 function parseFormExcel(buffer) {
-  const wb = XLSX.read(buffer, { type: 'array', cellDates: false, cellNF: false, cellText: false });
-  const retirementSheetName = findSheetName(wb.SheetNames, SHEET_KEYWORDS.retirement);
-  const payrollSheetName = findSheetName(wb.SheetNames, SHEET_KEYWORDS.payroll);
+  const wb = XLSX.read(buffer, { type: 'array', cellDates: false, cellNF: false, cellText: false, WTF: false });
+  const retirementSheetName = findSheetName(wb, SHEET_KEYWORDS.retirement);
+  const payrollSheetName = findSheetName(wb, SHEET_KEYWORDS.payroll);
 
   const retirementRows = retirementSheetName ? sheetToRows(wb.Sheets[retirementSheetName]) : [];
   const payrollRows = payrollSheetName ? sheetToRows(wb.Sheets[payrollSheetName]) : [];
@@ -106,20 +106,44 @@ function parseFormExcel(buffer) {
   };
 }
 
-function findSheetName(names, keywords) {
+function findSheetName(wbOrNames, keywords) {
+  const names = Array.isArray(wbOrNames) ? wbOrNames : (wbOrNames?.SheetNames || []);
+  const sheets = Array.isArray(wbOrNames) ? null : (wbOrNames?.Sheets || {});
   const norm = s => normalizeText(s);
   let best = null, score = 0;
+
+  // 1순위: 시트명으로 찾기
   for (const name of names) {
     const n = norm(name);
     let s = 0;
-    keywords.forEach(k => { if (n.includes(norm(k))) s += k.length; });
+    keywords.forEach(k => { if (n.includes(norm(k))) s += norm(k).length + 10; });
     if (s > score) { best = name; score = s; }
+  }
+
+  // 2순위: 시트명은 다르지만 내용 첫 부분에 관련 제목이 있는 경우
+  if (sheets) {
+    for (const name of names) {
+      const sheet = sheets[name];
+      if (!sheet || !sheet['!ref']) continue;
+      const preview = sheetToRows(sheet, 25).flat().join(' ');
+      const n = norm(preview);
+      let s = 0;
+      keywords.forEach(k => { if (n.includes(norm(k))) s += norm(k).length; });
+      if (s > score) { best = name; score = s; }
+    }
   }
   return best;
 }
 
-function sheetToRows(sheet) {
-  const range = XLSX.utils.decode_range(sheet['!ref'] || 'A1:A1');
+function sheetToRows(sheet, maxRows = Infinity) {
+  if (!sheet || !sheet['!ref']) return [];
+  let range;
+  try {
+    range = XLSX.utils.decode_range(sheet['!ref']);
+  } catch (e) {
+    return [];
+  }
+  if (Number.isFinite(maxRows)) range.e.r = Math.min(range.e.r, range.s.r + maxRows - 1);
   const merges = sheet['!merges'] || [];
   const rows = [];
   for (let r = range.s.r; r <= range.e.r; r++) {
@@ -246,10 +270,18 @@ async function parseBudgetPdf(buffer) {
 }
 
 function parseWorkbookBudget(buffer) {
-  const wb = XLSX.read(buffer, { type: 'array' });
+  const wb = XLSX.read(buffer, { type: 'array', cellDates: false, cellNF: false, cellText: false, WTF: false });
   let text = '';
-  wb.SheetNames.forEach(name => {
-    text += `\n[SHEET ${name}]\n` + XLSX.utils.sheet_to_csv(wb.Sheets[name]) + '\n';
+  (wb.SheetNames || []).forEach(name => {
+    const sheet = wb.Sheets?.[name];
+    if (!sheet || !sheet['!ref']) return;
+    let csv = '';
+    try {
+      csv = XLSX.utils.sheet_to_csv(sheet, { blankrows: false });
+    } catch (e) {
+      csv = sheetToRows(sheet).map(r => r.join(',')).join('\n');
+    }
+    text += `\n[SHEET ${name}]\n${csv}\n`;
   });
   return { sourceType: 'excel', entries: parseBudgetEntries(text), text };
 }
