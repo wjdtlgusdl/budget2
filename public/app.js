@@ -12,14 +12,15 @@ function tags(a){return a.map(x=>`<span class="school-tag">${x}</span>`).join(''
 function groupCard(g){return `<div class="group"><div class="result-title"><span class="badge">${g[1]}</span><strong>${g[0]}</strong></div><div class="group-label">해당 중학교</div><div class="schools">${tags(g[2])}</div>${g[4]?`<p class="warntext">※ ${g[4]}</p>`:''}</div>`}
 function namedGroupCard(name,schools,type='중학군',note=''){return `<div class="group"><div class="result-title"><span class="badge">${type}</span><strong>${name}</strong></div><div class="group-label">지원 가능한 중학교</div><div class="schools">${tags(schools)}</div>${note?`<p class="warntext">※ ${note}</p>`:''}</div>`}
 const FIXED_GROUP_INFO={
- '동화초':{name:'기안중학군 + 봉담중학군',type:'혼합지원'},
- '양산초':{name:'세교중학군 + 진안중학군',type:'혼합지원'},
- '세마초':{name:'세교중학군 + 오산중학군',type:'혼합지원'}
+ '동화초':{title:'기안중학군과 봉담중학군 혼합지원',groups:[['기안중학군',['기안중학교','와우중학교','화성동화중학교']],['봉담중학군',['봉담중학교','수현중학교']]]},
+ '양산초':{title:'세교중학군과 진안중학군 혼합지원',groups:[['세교중학군',['세마중학교','문시중학교','매홀중학교']],['진안중학군',['진안중학교']]]},
+ '세마초':{title:'세교중학군과 오산중학군 혼합지원',groups:[['세교중학군',['세마중학교','문시중학교','매홀중학교']],['오산중학군',['대호중학교','오산중학교']]]}
 };
+function mixedGroupCards(info){return info.groups.map(([name,schools])=>namedGroupCard(name,schools,'중학군')).join('')}
 const FIXED=new Set(['동화초','양산초','세마초']);
 function mixedRule(s){return AREA_RULES[Object.keys(AREA_RULES).find(k=>normSchool(k)===normSchool(s))]||null}
 function needsAddress(s){const gs=groupsFor(s);const r=mixedRule(s);return r?.type==='choice'||(gs.length>1&&!FIXED.has(normSchool(s)))}
-function direct(s){const gs=groupsFor(s),r=mixedRule(s);let h='';if(r?.type==='fixed'){const info=FIXED_GROUP_INFO[normSchool(s)]||{name:'혼합지원 중학군(구)',type:'혼합지원'};h=`<div class="status ok"><strong>${displaySchool(s)} 혼합지원 특례</strong><br>${r.text}</div><h3>지원 중학군(구)</h3>${namedGroupCard(info.name,r.schools,info.type)}${r.deny?.length?`<div class="rule-note"><strong>지원 제한</strong> · ${r.deny.join(', ')}</div>`:''}`;}else if(gs.length===1){h=`<div class="status ok"><strong>${gs[0][0]}</strong>으로 확인됩니다.</div><h3>배정 중학군(구)</h3>${groupCard(gs[0])}`;}return h}
+function direct(s){const gs=groupsFor(s),r=mixedRule(s);let h='';if(r?.type==='fixed'){const info=FIXED_GROUP_INFO[normSchool(s)];if(info){h=`<div class="status ok"><strong>${info.title}</strong></div><h3>지원 가능한 중학교</h3>${mixedGroupCards(info)}${r.deny?.length?`<div class="rule-note"><strong>지원 제한</strong> · ${r.deny.join(', ')}</div>`:''}`;}else{h=`<div class="status ok"><strong>${displaySchool(s)} 혼합지원</strong><br>${r.text}</div><h3>지원 가능한 중학교</h3>${namedGroupCard('혼합지원 중학군(구)',r.schools,'혼합지원')}`;}}else if(gs.length===1){h=`<div class="status ok"><strong>${gs[0][0]}</strong>으로 확인됩니다.</div><h3>배정 중학군(구)</h3>${groupCard(gs[0])}`;}return h}
 function lookup(){const s=canonicalSchool($('#school').value);currentSchool=s;$('#addressResult').className='result empty';$('#addressResult').textContent='주소를 입력하면 기존 통학구역 DB로 통·리·반을 확인합니다.';if(!s){$('#addressBox').classList.add('hidden');$('#basicResult').className='result empty';$('#basicResult').textContent='등록된 초등학교명을 확인해 주세요.';return}$('#school').value=displaySchool(s);const gs=groupsFor(s);if(needsAddress(s)){ $('#addressBox').classList.remove('hidden');$('#addressReason').textContent=`${displaySchool(s)}는 거주지역에 따라 적용 중학군(구) 또는 공동학구가 달라질 수 있습니다.`;$('#basicResult').className='result';$('#basicResult').innerHTML=`<div class="status warn"><strong>주소 확인 필요</strong><br>초등학교명만으로 최종 범위를 확정하지 않습니다.</div><h3>주소 확인 전 가능한 중학군(구)</h3>${gs.map(groupCard).join('')}`;}else{$('#addressBox').classList.add('hidden');$('#basicResult').className='result';$('#basicResult').innerHTML=direct(s)}}
 $('#lookup').onclick=lookup;$('#school').addEventListener('keydown',e=>{if(e.key==='Enter')lookup()});
 function nkey(s){return String(s||'').toLowerCase().replace(/경기도/g,'').replace(/[\s.,()]/g,'')}
